@@ -1,0 +1,20 @@
+<?php
+return[
+    'home' => 'BERANDA',
+    'about' => 'TENTANG',
+    'news' => 'BERITA',
+    'lri' =>  'LEMBAGA RISET INTERNASIONAL',
+    'maritime' => 'Kemaritiman, Kelautan dan Perikanan',
+    'technology' => 'Teknologi Maju',
+    'environment' => 'Lingkungan dan Perubahan Iklim',
+    'food' => 'Pangan, Gizi dan Kesehatan',
+    'social' => 'Sosial , Ekonomi dan Kawasan',
+    'gallery' => 'GALERI',
+    'news_title' =>  'Berita Terkini',
+    'news_published' => 'Dipublikasi oleh',
+    'profile_title' => 'Profil',
+    'whatis_lri' => 'Apa Itu LRI',
+    'location' => 'Temukan Kami',
+    'click_here' => 'Klik Disini',
+    'publication' => 'PUBLIKASI',
+];

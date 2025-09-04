@@ -1,0 +1,20 @@
+<?php
+return[
+    'home' => 'HOME',
+    'about' => 'ABOUT',
+    'news' => 'NEWS',
+    'lri' => 'INTERNATIONAL RESEARCH INSTITUTE',
+    'maritime' => 'Maritime, Ocean and Fisheries',
+    'technology' => 'Advanced Technology',
+    'environment' => 'Environment and Climate Change',
+    'food' => 'Food, Nutrition and Health',
+    'social' => 'Social, Economics and Regional Studies',
+    'gallery' => 'GALLERY',
+    'news_title' =>  'Latest News',
+    'news_published' => 'Published by',
+    'profile_title' => 'Profile',
+    'whatis_lri' => 'What Is LRI',
+    'location' => 'Find Our Location',
+    'click_here' => 'Click Here',
+    'publication' => 'PUBLICATION',
+];
