@@ -27,10 +27,9 @@ use TCG\Voyager\Facades\Voyager;
 | be assigned to the "web" middleware group. Make something great!
 |
 */
-Route::get('/', [HomeController::class,'index']);
-// Route::get('/', function () {
-//     return view('welcome');
-// });
+Route::get('/', function () {
+    return redirect('/admin');
+});
 
 Route::post('/language-switch', [LanguageController::class, 'languageSwitch'])->name('language.switch');
 
