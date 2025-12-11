@@ -59,8 +59,9 @@ Route::get('/publication', [PublicationController::class,'index']);
 //     Voyager::routes();
 // });
 
-Route::get('/scrape-ipb', [ScrapeIpbController::class, 'scrapeAndPost']);
+// Route::get('/scrape-ipb', [ScrapeIpbController::class, 'scrapeAndPost']);
 Route::get('/post-scrape', [ScrapeIpbController::class, 'autoPost']);
+Route::get('/cek-scrape', [ScrapeIpbController::class, 'autoPostDebug']);
 
 Route::group(['as' => 'voyager.','prefix' => 'admin'], function () {
     event(new Routing());

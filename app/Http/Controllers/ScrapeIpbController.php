@@ -3,329 +3,523 @@
 namespace App\Http\Controllers;
 
 use App\Models\SumberBerita;
-use App\Services\IpbScraperService;
-use App\Services\WordpressService;
 use Goutte\Client;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Log;
+use Symfony\Component\DomCrawler\Crawler;
 
 class ScrapeIpbController extends Controller
 {
     protected $client;
+
+    // WP credentials & endpoints (sesuaikan jika perlu)
+    protected $wpTokenUrl = "https://lri.ipb.ac.id/wp-json/jwt-auth/v1/token";
+    protected $wpPostUrl  = "https://lri.ipb.ac.id/wp-json/wp/v2/posts";
+    protected $wpMediaUrl = "https://lri.ipb.ac.id/wp-json/wp/v2/media";
+    protected $wpUsername = "Admin-Web";
+    protected $wpPassword = "D3qr0Th8a!KglwgXL65*Biu)";
 
     public function __construct()
     {
         $this->client = new Client();
     }
 
+    /**
+     * Main autoPost: iterate sumber berita, scrape, upload image, post to WP.
+     */
     public function autoPost()
     {
-        $loginResponse = Http::withOptions(['verify' => false])
-        ->timeout(60)
-        ->post("https://lri.ipb.ac.id/wp-json/jwt-auth/v1/token", [
-            'username' => "Admin-Web",
-            'password' => "D3qr0Th8a!KglwgXL65*Biu)",
-        ]);
+        $results = [];
+        Log::info("=== AutoPost Started ===");
 
-        $token = $loginResponse->json('token');
+        // login
+        $token = $this->getWpToken();
+        if (!$token) {
+            Log::error("AutoPost aborted: gagal login ke WP.");
+            return response()->json(['status' => 'Login gagal ke WP'], 500);
+        }
+
         $sumber_beritas = SumberBerita::all();
-        $postUrl = "https://lri.ipb.ac.id/wp-json/wp/v2/posts";
-        foreach($sumber_beritas as $sumber_berita){
-            try{
-                $news = $this->getLatestNewsWithContent($sumber_berita->url_link);
+
+        foreach ($sumber_beritas as $sumber) {
+            $src = $sumber->url_link;
+            Log::info("Processing source", ['source' => $src]);
+
+            try {
+                $news = $this->getLatestNewsWithContent($src);
+
                 if (empty($news)) {
                     $results[] = [
-                        'source' => $sumber_berita->url_link,
+                        'source' => $src,
                         'status' => 'Tidak ada berita ditemukan'
                     ];
+                    Log::warning("Tidak ada berita", ['source' => $src]);
                     continue;
                 }
+
                 $latest = $news[0];
-                $slug = Str::slug($latest['title']);
+                $slug = Str::slug($latest['title'] ?? '');
 
-                // --- 3. Cek duplikat ---
-                $checkResponse = Http::withToken($token)->get($postUrl, [
-                    'slug' => $slug,
-                    'per_page' => 1,
-                ]);
+                // safety: jika title kosong gunakan timestamp+domain
+                if (empty($slug)) {
+                    $slug = Str::slug(parse_url($src, PHP_URL_HOST) . '-' . time());
+                }
 
-                if ($checkResponse->successful() && !empty($checkResponse->json())) {
+                // cek duplikasi — hanya anggap duplikat jika salah satu post returned punya slug persis sama
+                $isDuplicate = $this->wpCheckSlugExists($token, $slug);
+                if ($isDuplicate) {
                     $results[] = [
-                        'source' => $sumber_berita->url_link,
+                        'source' => $src,
                         'status' => 'Sudah ada, dilewati',
-                        'title' => $latest['title']
+                        'title' => $latest['title'] ?? null,
+                        'slug'  => $slug
                     ];
+                    Log::info("Sudah ada, dilewati", ['title' => $latest['title'] ?? null, 'slug' => $slug]);
                     continue;
                 }
 
-                // --- 4. Upload image ---
+                // upload image (jika ada)
                 $featuredMediaId = null;
                 if (!empty($latest['image'])) {
-                    try {
-                        $imageContent = file_get_contents($latest['image']);
-                        $imageName = basename($latest['image']);
-
-                        $imageResponse = Http::withToken($token)
-                            ->attach('file', $imageContent, $imageName)
-                            ->post("https://lri.ipb.ac.id/wp-json/wp/v2/media", [
-                                'title' => $latest['title']
-                            ]);
-
-                        if ($imageResponse->successful()) {
-                            $featuredMediaId = $imageResponse->json('id');
-                        }
-                    } catch (\Exception $e) {
-                        $featuredMediaId = null;
-                    }
+                    $featuredMediaId = $this->uploadImageToWp($token, $latest['image'], $latest['title'] ?? null);
                 }
-                // --- 5. Posting ke WP ---
-                $postResponse = Http::withToken($token)->post($postUrl, [
-                    'title'   => $latest['title'],
+
+                // posting
+                $postPayload = [
+                    'title'   => $latest['title'] ?? '',
                     'slug'    => $slug,
                     'status'  => 'publish',
-                    'content' => $latest['content'],
-                    'excerpt' => $latest['excerpt'],
-                    'featured_media' => $featuredMediaId,
+                    'content' => $latest['content'] ?? ($latest['excerpt'] ?? ''),
+                    'excerpt' => $latest['excerpt'] ?? '',
                     'meta_input' => [
-                        'source_url' => $latest['link'],
+                        'source_url' => $latest['link'] ?? $src
                     ],
-                    'categories' => [$sumber_berita->category_id]
-                ]);
+                ];
+
+                if ($featuredMediaId) {
+                    $postPayload['featured_media'] = $featuredMediaId;
+                }
+
+                // add categories if available on sumber_berita record
+                if (!empty($sumber->category_id)) {
+                    $postPayload['categories'] = [$sumber->category_id];
+                }
+
+                $postResponse = Http::withToken($token)->post($this->wpPostUrl, $postPayload);
 
                 if ($postResponse->failed()) {
                     $results[] = [
-                        'source' => $sumber_berita->url_link,
+                        'source' => $src,
                         'status' => 'Gagal posting',
+                        'title'  => $latest['title'] ?? null,
                         'error'  => $postResponse->json()
                     ];
+                    Log::error("Gagal posting", ['source' => $src, 'error' => $postResponse->json()]);
                     continue;
                 }
 
                 $results[] = [
-                    'source' => $sumber_berita->url_link,
+                    'source' => $src,
                     'status' => 'Berhasil posting',
-                    'title'  => $latest['title']
+                    'title'  => $latest['title'] ?? null,
+                    'wp_response' => $postResponse->json()
                 ];
+                Log::info("Berhasil posting", ['title' => $latest['title'] ?? null, 'source' => $src]);
+
             } catch (\Exception $e) {
                 $results[] = [
-                    'source' => $sumber_berita->url_link,
-                    'status' => 'Error',
+                    'source' => $src,
+                    'status' => 'Error Exception',
                     'error'  => $e->getMessage()
                 ];
+                Log::error("Exception terjadi", ['source' => $src, 'error' => $e->getMessage()]);
             }
-            sleep(60); // jeda 60 detik
-        }
-    }
-    
-    public function scrapeAndPostToWordpress($url)
-    {
-        // 1. Ambil berita terbaru
-        // $sumber_beritas = SumberBerita::all();
-        // var_dump($sumber_berita);die;
-        $news = $this->getLatestNewsWithContent($url);
-        $postUrl = "https://lri.ipb.ac.id/wp-json/wp/v2/posts";
-        if (empty($news)) {
-            return response()->json(['error' => 'Tidak ada berita ditemukan'], 404);
+
+            // jeda kecil antar sumber untuk mengurangi beban
+            sleep(3);
         }
 
-        $latest = $news[0]; // karena kita ambil 1 berita saja
-
-        // 2. Login ke WP via JWT
-        $wpUrl = "https://lri.ipb.ac.id/wp-json/jwt-auth/v1/token";
-        $username = "Admin-Web";   // ganti username WP
-        $password = "D3qr0Th8a!KglwgXL65*Biu)"; // ganti password WP
-
-        $loginResponse = Http::post($wpUrl, [
-            'username' => $username,
-            'password' => $password,
-        ]);
-
-        if ($loginResponse->failed()) {
-            return response()->json(['error' => 'Login ke WordPress gagal', 'response' => $loginResponse->json()], 500);
-        }
-
-        $token = $loginResponse->json('token');
-
-        // 3. Cek apakah postingan dengan judul yang sama sudah ada (pakai slug)
-        $slug = Str::slug($latest['title']); // pastikan tambahkan use Illuminate\Support\Str;
-        $checkResponse = Http::withToken($token)->get($postUrl, [
-            'slug' => $slug,
-            'per_page' => 1,
-        ]);
-
-        if ($checkResponse->successful()) {
-            $existingPosts = $checkResponse->json();
-            if (!empty($existingPosts)) {
-                return response()->json([
-                    'message' => 'Berita dengan judul ini sudah ada (slug match), dilewati.',
-                    'title'   => $latest['title']
-                ]);
-            }
-        }
-
-        // 4. Upload image jika ada
-        $featuredMediaId = null;
-
-        if (!empty($latest['image'])) {
-            try {
-                // Ambil isi file gambar ukuran besar
-                $imageContent = file_get_contents($latest['image']);
-                $imageName = basename($latest['image']);
-
-                $imageResponse = Http::withToken($token)
-                    ->attach('file', $imageContent, $imageName)
-                    ->post("https://lri.ipb.ac.id/wp-json/wp/v2/media", [
-                        'title' => $latest['title']
-                    ]);
-
-                if ($imageResponse->successful()) {
-                    $featuredMediaId = $imageResponse->json('id');
-                }
-            } catch (\Exception $e) {
-                // gagal upload image, biarkan saja tanpa featured image
-                $featuredMediaId = null;
-            }
-        }
-
-        // 5. Posting berita ke WP
-
-        $postResponse = Http::withToken($token)->post($postUrl, [
-            'title'   => $latest['title'],
-            'slug'    => $slug,
-            'status'  => 'publish', // bisa 'draft' kalau mau review dulu
-            'content' => $latest['content'],
-            'excerpt' => $latest['excerpt'],
-            'featured_media' => $featuredMediaId, // kalau null, otomatis skip
-            'meta_input' => [
-                'source_url' => $latest['link'], // simpan sumber berita
-            ]
-        ]);
-
-        if ($postResponse->failed()) {
-            return response()->json(['error' => 'Gagal posting ke WordPress', 'response' => $postResponse->json()], 500);
-        }
+        Log::info("=== AutoPost Finished ===", $results);
 
         return response()->json([
-            'message' => 'Berita berhasil diposting ke WordPress!',
-            // 'wp_response' => $postResponse->json(),
+            'total_sources' => count($sumber_beritas),
+            'results' => $results
         ]);
     }
 
-    public function getLatestNewsWithContent($url)
+    /**
+     * Debug endpoint for single URL
+     */
+    public function autoPostDebug()
     {
-        // $url = 'https://biotech-center.ipb.ac.id/berita-acara/';
-        $crawler = $this->client->request('GET', $url);
+        $testUrl = "https://pplh.ipb.ac.id/category/berita/";
+        $results = [];
 
-        $news = [];
+        Log::info("=== DEBUG AutoPost for URL Started ===", ['url' => $testUrl]);
 
-        // Ambil hanya 1 item pertama
-        $firstNode = $crawler->filter('.news-item, .entry, .post, .col-md-9 article')->first();
+        try {
+            $news = $this->getLatestNewsWithContent($testUrl);
+            Log::info("DEBUG: getLatestNewsWithContent result", ['data' => $news]);
 
-        if ($firstNode->count()) {
-            // Link & gambar
-            $titleNode = $firstNode->filter('h1 a, h2 a, h3 a, h4 a, h5 a, a');
-            $link  = $titleNode->count() ? $titleNode->attr('href') : '';
-
-            $image = '';
-            if ($firstNode->filter('img')->count()) {
-                $image = $firstNode->filter('img')->first()->attr('src');
+            if (empty($news)) {
+                $results['scrape_status'] = "Gagal: Tidak ada berita ditemukan";
+                return response()->json($results);
             }
 
-            $excerpt = '';
-            if ($firstNode->filter('p')->count()) {
-                $excerpt = trim($firstNode->filter('p')->first()->text());
+            $latest = $news[0];
+            $results['scrape_status'] = "Berhasil mengambil data";
+            $results['scraped_raw'] = $latest;
+
+            // slug
+            $slug = Str::slug($latest['title'] ?? '');
+            $results['slug'] = $slug;
+
+            // login test
+            $token = $this->getWpToken();
+            if (!$token) {
+                $results['login_status'] = 'Gagal login';
+                return response()->json($results, 500);
             }
+            $results['login_status'] = 'Berhasil login';
 
-            $title = '';
-            $content = '';
+            // check slug
+            $existsRaw = $this->wpRawCheckSlug($token, $slug);
+            $results['wp_slug_check_raw'] = $existsRaw;
+            $exists = $this->wpCheckSlugExistsConfirmed($existsRaw, $slug);
+            $results['wp_slug_check'] = $exists ? "Slug ditemukan → WP menganggap posting sudah ada" : "Slug tidak ditemukan → aman untuk posting";
 
-            if (!empty($link)) {
+            // image test
+            $results['image_test'] = $latest['image'] ?? null;
+            if (!empty($latest['image'])) {
                 try {
-                    $detailCrawler = $this->client->request('GET', $link);
-
-                    // Judul
-                    if ($detailCrawler->filter('meta[property="og:title"]')->count()) {
-                        $title = trim($detailCrawler->filter('meta[property="og:title"]')->attr('content'));
-                    } elseif ($detailCrawler->filter('h1')->count()) {
-                        $title = trim($detailCrawler->filter('h1')->first()->text());
-                    } elseif ($detailCrawler->filter('title')->count()) {
-                        $pageTitle = $detailCrawler->filter('title')->text();
-                        $parts = explode('-', $pageTitle);
-                        $title = trim($parts[0]);
-                    } else {
-                        $parts = parse_url($link);
-                        $path = $parts['path'] ?? '';
-                        $slug = trim($path, '/');
-                        $segments = explode('/', $slug);
-                        $last = end($segments);
-                        $title = ucwords(str_replace('-', ' ', $last));
-                    }
-
-                    // Konten
-                    if ($detailCrawler->filter('.post-content')->count()) {
-                        $content = $detailCrawler->filter('.post-content')->html();
-                    } elseif ($detailCrawler->filter('.entry-content')->count()) {
-                        $content = $detailCrawler->filter('.entry-content')->html();
-                    } elseif ($detailCrawler->filter('article .content')->count()) {
-                        $content = $detailCrawler->filter('article .content')->html();
-                    }
-                    // Hapus <img> pertama biar tidak double dengan featured image
-                    if (!empty($content)) {
-                        $content = preg_replace('/<img[^>]+>/i', '', $content, 1);
-                    }
-
-                    // Cari gambar besar dari halaman detail
-                    if ($detailCrawler->filter('meta[property="og:image"]')->count()) {
-                        $image = $detailCrawler->filter('meta[property="og:image"]')->attr('content');
-                    } elseif ($detailCrawler->filter('.post-content img')->count()) {
-                        $image = $detailCrawler->filter('.post-content img')->first()->attr('src');
-                    }
+                    $imageContent = file_get_contents($latest['image']);
+                    $results['image_status'] = "Berhasil diambil";
+                    $results['image_size'] = strlen($imageContent);
                 } catch (\Exception $e) {
-                    $title = $title ?: $excerpt;
-                    $content = $excerpt;
+                    $results['image_status'] = "Gagal diambil";
+                    $results['image_error'] = $e->getMessage();
                 }
             }
 
-            $news[] = [
-                'title'   => $title,
-                'image'   => $image,
-                'link'    => $link,
-                'excerpt' => $excerpt,
-                'content' => $content,
-            ];
+            Log::info("=== DEBUG AutoPost Finished ===", $results);
+            return response()->json($results);
+
+        } catch (\Exception $e) {
+            Log::error("DEBUG Exception", ['error' => $e->getMessage()]);
+            return response()->json(['error' => $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Improved multi-site scraper:
+     * - If URL is a listing (category / archive), tries to extract first article link
+     * - Supports multiple selectors including Astra, Jeg, WP default, custom classes
+     */
+    public function getLatestNewsWithContent($url)
+    {
+        Log::info("Scraping URL", ['url' => $url]);
+
+        // 1) request page
+        try {
+            $crawler = $this->client->request('GET', $url);
+        } catch (\Exception $e) {
+            Log::error("Failed request", ['url' => $url, 'error' => $e->getMessage()]);
+            return [];
+        }
+
+        // 2) If page looks like listing/category — try detect first article link
+        $firstArticleLink = $this->extractFirstArticleLinkFromListing($crawler);
+        if ($firstArticleLink) {
+            Log::info("Detected listing page; first article link found", ['link' => $firstArticleLink]);
+            // request detail page
+            try {
+                $detailCrawler = $this->client->request('GET', $firstArticleLink);
+            } catch (\Exception $e) {
+                Log::error("Failed request detail", ['link' => $firstArticleLink, 'error' => $e->getMessage()]);
+                return [];
+            }
+            return $this->buildNewsFromDetailCrawler($detailCrawler, $firstArticleLink);
+        }
+
+        // 3) If not listing, try to detect article nodes on page (single article page)
+        // If page has <article> or post content, treat as detail page
+        if ($crawler->filter('article')->count() || $crawler->filter('.post-content')->count() || $crawler->filter('.entry-content')->count()) {
+            Log::info("Page appears to be article/detail page", ['url' => $url]);
+            return $this->buildNewsFromDetailCrawler($crawler, $url);
+        }
+
+        // 4) fallback: attempt to find first link in common containers
+        $link = null;
+        $candidates = [
+            'h2.entry-title a', // Astra
+            'h3.entry-title a',
+            '.jeg_post .jeg_post_title a', // Jeg theme
+            '.post-item a',
+            '.news-item a',
+            '.entry a'
+        ];
+        foreach ($candidates as $sel) {
+            if ($crawler->filter($sel)->count()) {
+                $link = $crawler->filter($sel)->first()->attr('href');
+                break;
+            }
+        }
+
+        if ($link) {
+            try {
+                $detailCrawler = $this->client->request('GET', $link);
+                return $this->buildNewsFromDetailCrawler($detailCrawler, $link);
+            } catch (\Exception $e) {
+                Log::error("Fallback detail request failed", ['link' => $link, 'error' => $e->getMessage()]);
+                return [];
+            }
+        }
+
+        // nothing found
+        Log::warning("No article found on page", ['url' => $url]);
+        return [];
+    }
+
+    /**
+     * Given a listing page crawler, try multiple selectors to return the first article URL.
+     */
+    protected function extractFirstArticleLinkFromListing(Crawler $crawler)
+    {
+        // Common: Astra theme: h2.entry-title > a (inside article)
+        if ($crawler->filter('h2.entry-title a')->count()) {
+            return $crawler->filter('h2.entry-title a')->first()->attr('href');
+        }
+
+        // Jeg theme: .jeg_posts .jeg_post .jeg_post_title a
+        if ($crawler->filter('.jeg_post .jeg_post_title a')->count()) {
+            return $crawler->filter('.jeg_post .jeg_post_title a')->first()->attr('href');
+        }
+
+        // WP default: article .entry-title a
+        if ($crawler->filter('article .entry-title a')->count()) {
+            return $crawler->filter('article .entry-title a')->first()->attr('href');
+        }
+
+        // Generic: .post-item a, .news-item a, .post a
+        $genericSelectors = ['.post-item a', '.news-item a', '.post a', '.entry a', '.col-md-9 article h2 a'];
+        foreach ($genericSelectors as $sel) {
+            if ($crawler->filter($sel)->count()) {
+                return $crawler->filter($sel)->first()->attr('href');
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Build news array from a detail page crawler
+     */
+    protected function buildNewsFromDetailCrawler(Crawler $detailCrawler, $url)
+    {
+        $news = [];
+
+        // Title: prefer og:title, then h1, then .entry-title, then <title>
+        $title = null;
+        if ($detailCrawler->filter('meta[property="og:title"]')->count()) {
+            $title = trim($detailCrawler->filter('meta[property="og:title"]')->attr('content'));
+        } elseif ($detailCrawler->filter('h1')->count()) {
+            $title = trim($detailCrawler->filter('h1')->first()->text());
+        } elseif ($detailCrawler->filter('.entry-title')->count()) {
+            $title = trim($detailCrawler->filter('.entry-title')->first()->text());
+        } elseif ($detailCrawler->filter('title')->count()) {
+            $pageTitle = $detailCrawler->filter('title')->text();
+            $parts = preg_split('/\s*[-|—]\s*/u', $pageTitle);
+            $title = trim($parts[0] ?? $pageTitle);
+        }
+
+        // Excerpt: meta description or first paragraph
+        $excerpt = '';
+        if ($detailCrawler->filter('meta[name="description"]')->count()) {
+            $excerpt = trim($detailCrawler->filter('meta[name="description"]')->attr('content'));
+        } elseif ($detailCrawler->filter('.entry-content p')->count()) {
+            $excerpt = trim($detailCrawler->filter('.entry-content p')->first()->text());
+        } elseif ($detailCrawler->filter('.post-content p')->count()) {
+            $excerpt = trim($detailCrawler->filter('.post-content p')->first()->text());
+        } elseif ($detailCrawler->filter('article p')->count()) {
+            $excerpt = trim($detailCrawler->filter('article p')->first()->text());
+        }
+
+        // Content: prefer .post-content, .entry-content, article .content, article
+        $content = '';
+        if ($detailCrawler->filter('.post-content')->count()) {
+            $content = $detailCrawler->filter('.post-content')->html();
+        } elseif ($detailCrawler->filter('.entry-content')->count()) {
+            $content = $detailCrawler->filter('.entry-content')->html();
+        } elseif ($detailCrawler->filter('article .content')->count()) {
+            $content = $detailCrawler->filter('article .content')->html();
+        } elseif ($detailCrawler->filter('article')->count()) {
+            // use whole article inner html
+            $content = $detailCrawler->filter('article')->first()->html();
+        } else {
+            // fallback: full body
+            $content = $detailCrawler->filter('body')->first()->html();
+        }
+
+        // Remove first image from content (we will upload as featured)
+        if (!empty($content)) {
+            $content = preg_replace('/<img[^>]+>/i', '', $content, 1);
+        }
+
+        // Image selection: priority og:image -> .post-thumbnail img -> first img in content -> any img in page
+        $image = null;
+        if ($detailCrawler->filter('meta[property="og:image"]')->count()) {
+            $image = $detailCrawler->filter('meta[property="og:image"]')->attr('content');
+        } elseif ($detailCrawler->filter('.post-thumbnail img')->count()) {
+            $image = $detailCrawler->filter('.post-thumbnail img')->first()->attr('src');
+        } elseif ($detailCrawler->filter('.entry-content img')->count()) {
+            $image = $detailCrawler->filter('.entry-content img')->first()->attr('src');
+        } elseif ($detailCrawler->filter('article img')->count()) {
+            $image = $detailCrawler->filter('article img')->first()->attr('src');
+        } elseif ($detailCrawler->filter('img')->count()) {
+            $image = $detailCrawler->filter('img')->first()->attr('src');
+        }
+
+        // Clean relative URLs for images/links to absolute if needed
+        $image = $this->normalizeUrl($image, $url);
+
+        $news[] = [
+            'title'   => $title ?: '',
+            'image'   => $image ?: '',
+            'link'    => $url,
+            'excerpt' => $excerpt ?: '',
+            'content' => $content ?: '',
+        ];
 
         return $news;
     }
 
-    public function scrapeAndPost()
+    /**
+     * Normalize possibly relative URLs against base.
+     */
+    protected function normalizeUrl($maybeUrl, $base)
     {
-        $scraper = new IpbScraperService();
-        $wp = new WordpressService();
-
-        // $newsList = $scraper->getFullContent("https://www.ipb.ac.id/news/index/2025/08/ipb-university-wisuda-186-fasilitator-sekolah-keluarga-berkualitas/");
-        $newsList = $scraper->getLatestNewsWithContent();
-        echo "<pre>";
-        // echo "tes";
-        var_dump($newsList);die;
-        echo "</pre>";
-
-        foreach ($newsList as $news) {
-            // (Opsional) ambil konten penuh dari halaman detail:
-            $fullContent = $scraper->getFullContent($news['link']);
-
-            // Jika konten detail kosong, fallback ke excerpt:
-            $content = $fullContent ?: $news['excerpt'];
-
-            $result = $wp->createPost($news['title'], $content);
-
-            \Log::info("Posted: {$news['title']} → ID {$result['id']}");
+        if (empty($maybeUrl)) return null;
+        // If absolute already
+        if (parse_url($maybeUrl, PHP_URL_SCHEME)) {
+            return $maybeUrl;
         }
+        // Build absolute
+        $baseParts = parse_url($base);
+        $scheme = $baseParts['scheme'] ?? 'https';
+        $host = $baseParts['host'] ?? '';
+        $path = $maybeUrl;
+        if (strpos($path, '/') === 0) {
+            return $scheme . '://' . $host . $path;
+        }
+        // relative path
+        $basePath = $baseParts['path'] ?? '/';
+        $baseDir = rtrim(dirname($basePath), '/') . '/';
+        return $scheme . '://' . $host . $baseDir . ltrim($path, '/');
+    }
 
-        return response()->json([
-            'message' => 'Scraping & posting selesai.',
-            'count' => count($newsList),
-            'titles' => array_column($newsList, 'title'),
-        ]);
+    /**
+     * Get WP JWT token
+     */
+    protected function getWpToken()
+    {
+        try {
+            $loginResponse = Http::withOptions(['verify' => false])
+                ->timeout(60)
+                ->post($this->wpTokenUrl, [
+                    'username' => $this->wpUsername,
+                    'password' => $this->wpPassword,
+                ]);
+
+            if ($loginResponse->failed()) {
+                Log::error("WP login failed", ['response' => $loginResponse->json()]);
+                return null;
+            }
+
+            return $loginResponse->json('token');
+        } catch (\Exception $e) {
+            Log::error("WP login exception", ['error' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /**
+     * Upload image to WP and return media ID or null
+     */
+    protected function uploadImageToWp($token, $imageUrl, $title = null)
+    {
+        if (empty($imageUrl)) return null;
+
+        try {
+            // get image bytes
+            $imageContent = @file_get_contents($imageUrl);
+            if ($imageContent === false) {
+                Log::warning("Failed to fetch image for upload", ['image' => $imageUrl]);
+                return null;
+            }
+
+            $imageName = basename(parse_url($imageUrl, PHP_URL_PATH) ?: 'image.jpg');
+
+            $imageResponse = Http::withToken($token)
+                ->attach('file', $imageContent, $imageName)
+                ->post($this->wpMediaUrl, [
+                    'title' => $title ?: $imageName
+                ]);
+
+            if ($imageResponse->successful()) {
+                $mediaId = $imageResponse->json('id');
+                Log::info("Image uploaded to WP", ['image' => $imageUrl, 'media_id' => $mediaId]);
+                return $mediaId;
+            } else {
+                Log::error("Image upload failed", ['image' => $imageUrl, 'response' => $imageResponse->json()]);
+                return null;
+            }
+        } catch (\Exception $e) {
+            Log::error("Exception uploading image", ['image' => $imageUrl, 'error' => $e->getMessage()]);
+            return null;
+        }
+    }
+
+    /**
+     * Basic check: query WP posts by slug and return raw response array
+     */
+    protected function wpRawCheckSlug($token, $slug)
+    {
+        try {
+            $checkResponse = Http::withToken($token)->get($this->wpPostUrl, [
+                'slug' => $slug,
+                'per_page' => 5,
+            ]);
+
+            if ($checkResponse->successful()) {
+                return $checkResponse->json();
+            }
+
+            return [];
+        } catch (\Exception $e) {
+            Log::error("wpRawCheckSlug exception", ['error' => $e->getMessage()]);
+            return [];
+        }
+    }
+
+    /**
+     * Safer check: verify returned posts actually contain matching slug.
+     */
+    protected function wpCheckSlugExists($token, $slug)
+    {
+        $raw = $this->wpRawCheckSlug($token, $slug);
+        return $this->wpCheckSlugExistsConfirmed($raw, $slug);
+    }
+
+    protected function wpCheckSlugExistsConfirmed($rawArray, $slug)
+    {
+        if (empty($rawArray) || !is_array($rawArray)) return false;
+
+        foreach ($rawArray as $post) {
+            if (!empty($post['slug']) && $post['slug'] === $slug) {
+                return true;
+            }
+        }
+        return false;
     }
 }
