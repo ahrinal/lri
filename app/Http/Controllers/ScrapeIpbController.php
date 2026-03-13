@@ -59,6 +59,18 @@ class ScrapeIpbController extends Controller
                 }
 
                 $latest = $news[0];
+
+                // Filter: jika image tidak ada atau jumlah karakter content kurang dari 200
+                $contentLength = mb_strlen(strip_tags($latest['content'] ?? ''));
+                if (empty($latest['image']) || $contentLength < 200) {
+                    $results[] = [
+                        'source' => $src,
+                        'status' => 'Dilewati: Image tidak ada atau jumlah karakter kurang dari 200 karakter'
+                    ];
+                    Log::info("Dilewati karena filter", ['source' => $src, 'length' => $contentLength]);
+                    continue;
+                }
+
                 $slug = Str::slug($latest['title'] ?? '');
 
                 // safety: jika title kosong gunakan timestamp+domain
@@ -168,6 +180,15 @@ class ScrapeIpbController extends Controller
             }
 
             $latest = $news[0];
+
+            // Filter: jika image tidak ada atau jumlah karakter content kurang dari 200
+            $contentLength = mb_strlen(strip_tags($latest['content'] ?? ''));
+            if (empty($latest['image']) || $contentLength < 200) {
+                $results['scrape_status'] = "Dilewati: Image tidak ada atau jumlah karakter kurang dari 200 karakter";
+                $results['scraped_raw'] = $latest;
+                return response()->json($results);
+            }
+
             $results['scrape_status'] = "Berhasil mengambil data";
             $results['scraped_raw'] = $latest;
 
