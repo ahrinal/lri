@@ -233,6 +233,51 @@ class ScrapeIpbController extends Controller
     }
 
     /**
+     * Dummy endpoint for Postman testing
+     * Accepts query params: ?has_image=1&length=250
+     */
+    public function autoPostDummyTest(\Illuminate\Http\Request $request)
+    {
+        $hasImage = $request->query('has_image', 1);
+        $length = $request->query('length', 250);
+
+        // Mock data
+        $latest = [
+            'title' => 'Dummy Berita Test',
+            'link' => 'https://dummy.ipb.ac.id/berita-test',
+            'image' => $hasImage ? 'https://lri.ipb.ac.id/wp-content/uploads/2026/03/IMG-20260311-WA0054-scaled-1.jpg' : null,
+            'excerpt' => 'Ini adalah excerpt dummy.',
+            'content' => str_repeat('A', (int)$length), // Generate string with specific length
+        ];
+
+        Log::info("=== DUMMY AutoPost Test Started ===", ['params' => $request->all()]);
+
+        $results = [];
+
+        // Apply same filter logic as autoPost and autoPostDebug
+        $contentLength = mb_strlen(strip_tags($latest['content'] ?? ''));
+        
+        if (empty($latest['image']) || $contentLength < 200) {
+            $results['scrape_status'] = "Dilewati: Image tidak ada atau jumlah karakter kurang dari 200 karakter";
+            $results['reason'] = [
+                'has_image' => !empty($latest['image']),
+                'content_length' => $contentLength
+            ];
+            $results['scraped_raw'] = $latest;
+            return response()->json($results);
+        }
+
+        $results['scrape_status'] = "Berhasil: Data memenuhi syarat filter (Image ada dan length >= 200)";
+        $results['reason'] = [
+            'has_image' => true,
+            'content_length' => $contentLength
+        ];
+        $results['scraped_raw'] = $latest;
+        
+        return response()->json($results);
+    }
+
+    /**
      * Improved multi-site scraper:
      * - If URL is a listing (category / archive), tries to extract first article link
      * - Supports multiple selectors including Astra, Jeg, WP default, custom classes
